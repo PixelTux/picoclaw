@@ -1,6 +1,7 @@
 package channels
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -16,8 +17,11 @@ import (
 )
 
 const (
-	transcriptionTimeout = 30 * time.Second
-	sendTimeout          = 10 * time.Second
+	transcriptionTimeout   = 30 * time.Second
+	sendTimeout            = 10 * time.Second
+	discordChunkSize       = 1950
+	discordMaxChunks       = 2
+	discordMaxMessageChars = 2000
 )
 
 type DiscordChannel struct {
@@ -101,15 +105,19 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) erro
 		return fmt.Errorf("channel ID is empty")
 	}
 
-	runes := []rune(msg.Content)
-	if len(runes) == 0 {
+	if len(msg.Content) == 0 {
 		return nil
 	}
 
-	chunks := splitMessage(msg.Content, 1500) // Discord has a limit of 2000 characters per message, leave 500 for natural split e.g. code blocks
+	chunks := splitMessage(msg.Content, discordChunkSize)
 
-	for _, chunk := range chunks {
-		if err := c.sendChunk(ctx, channelID, chunk); err != nil {
+	if len(chunks) > discordMaxChunks {
+		return c.sendAsMarkdownFile(ctx, channelID, msg.Content)
+	}
+
+	for i, chunk := range chunks {
+		prefix := fmt.Sprintf("(%d/%d)\n", i+1, len(chunks))
+		if err := c.sendChunk(ctx, channelID, prefix+chunk); err != nil {
 			return err
 		}
 	}
@@ -117,134 +125,32 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) erro
 	return nil
 }
 
-// splitMessage splits long messages into chunks, preserving code block integrity
-// Uses natural boundaries (newlines, spaces) and extends messages slightly to avoid breaking code blocks
+// splitMessage splits long messages into chunks at natural boundaries
 func splitMessage(content string, limit int) []string {
-	var messages []string
+	var chunks []string
 
 	for len(content) > 0 {
 		if len(content) <= limit {
-			messages = append(messages, content)
+			chunks = append(chunks, content)
 			break
 		}
 
-		msgEnd := limit
-
-		// Find natural split point within the limit
-		msgEnd = findLastNewline(content[:limit], 200)
-		if msgEnd <= 0 {
-			msgEnd = findLastSpace(content[:limit], 100)
+		idx := strings.LastIndex(content[:limit], "\n")
+		if idx == -1 {
+			idx = strings.LastIndex(content[:limit], " ")
 		}
-		if msgEnd <= 0 {
-			msgEnd = limit
+		if idx == -1 {
+			idx = limit
 		}
 
-		// Check if this would end with an incomplete code block
-		candidate := content[:msgEnd]
-		unclosedIdx := findLastUnclosedCodeBlock(candidate)
-
-		if unclosedIdx >= 0 {
-			// Message would end with incomplete code block
-			// Try to extend to include the closing ``` (with some buffer)
-			extendedLimit := limit + 500 // Allow 500 char buffer for code blocks
-			if len(content) > extendedLimit {
-				closingIdx := findNextClosingCodeBlock(content, msgEnd)
-				if closingIdx > 0 && closingIdx <= extendedLimit {
-					// Extend to include the closing ```
-					msgEnd = closingIdx
-				} else {
-					// Can't find closing, split before the code block
-					msgEnd = findLastNewline(content[:unclosedIdx], 200)
-					if msgEnd <= 0 {
-						msgEnd = findLastSpace(content[:unclosedIdx], 100)
-					}
-					if msgEnd <= 0 {
-						msgEnd = unclosedIdx
-					}
-				}
-			} else {
-				// Remaining content fits within extended limit
-				msgEnd = len(content)
-			}
-		}
-
-		if msgEnd <= 0 {
-			msgEnd = limit
-		}
-
-		messages = append(messages, content[:msgEnd])
-		content = strings.TrimSpace(content[msgEnd:])
+		chunks = append(chunks, content[:idx])
+		content = strings.TrimSpace(content[idx:])
 	}
 
-	return messages
-}
-
-// findLastUnclosedCodeBlock finds the last opening ``` that doesn't have a closing ```
-// Returns the position of the opening ``` or -1 if all code blocks are complete
-func findLastUnclosedCodeBlock(text string) int {
-	count := 0
-	lastOpenIdx := -1
-
-	for i := 0; i < len(text); i++ {
-		if i+2 < len(text) && text[i] == '`' && text[i+1] == '`' && text[i+2] == '`' {
-			if count == 0 {
-				lastOpenIdx = i
-			}
-			count++
-			i += 2
-		}
-	}
-
-	// If odd number of ``` markers, last one is unclosed
-	if count%2 == 1 {
-		return lastOpenIdx
-	}
-	return -1
-}
-
-// findNextClosingCodeBlock finds the next closing ``` starting from a position
-// Returns the position after the closing ``` or -1 if not found
-func findNextClosingCodeBlock(text string, startIdx int) int {
-	for i := startIdx; i < len(text); i++ {
-		if i+2 < len(text) && text[i] == '`' && text[i+1] == '`' && text[i+2] == '`' {
-			return i + 3
-		}
-	}
-	return -1
-}
-
-// findLastNewline finds the last newline character within the last N characters
-// Returns the position of the newline or -1 if not found
-func findLastNewline(s string, searchWindow int) int {
-	searchStart := len(s) - searchWindow
-	if searchStart < 0 {
-		searchStart = 0
-	}
-	for i := len(s) - 1; i >= searchStart; i-- {
-		if s[i] == '\n' {
-			return i
-		}
-	}
-	return -1
-}
-
-// findLastSpace finds the last space character within the last N characters
-// Returns the position of the space or -1 if not found
-func findLastSpace(s string, searchWindow int) int {
-	searchStart := len(s) - searchWindow
-	if searchStart < 0 {
-		searchStart = 0
-	}
-	for i := len(s) - 1; i >= searchStart; i-- {
-		if s[i] == ' ' || s[i] == '\t' {
-			return i
-		}
-	}
-	return -1
+	return chunks
 }
 
 func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content string) error {
-	// 使用传入的 ctx 进行超时控制
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 
@@ -262,6 +168,33 @@ func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content strin
 		return nil
 	case <-sendCtx.Done():
 		return fmt.Errorf("send message timeout: %w", sendCtx.Err())
+	}
+}
+
+func (c *DiscordChannel) sendAsMarkdownFile(ctx context.Context, channelID, content string) error {
+	filename := fmt.Sprintf("message_%s.md", time.Now().Format("20060102_150405"))
+
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.session.ChannelFileSend(channelID, filename, bytes.NewBufferString(content))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("failed to send discord file: %w", err)
+		}
+		logger.InfoCF("discord", "Sent long message as markdown file", map[string]any{
+			"filename": filename,
+			"size":     len(content),
+		})
+		return nil
+	case <-sendCtx.Done():
+		return fmt.Errorf("send file timeout: %w", sendCtx.Err())
 	}
 }
 
